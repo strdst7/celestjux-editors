@@ -92,15 +92,44 @@ CJX_HANDLE = (
     "  } catch (e) { return null; }"
     "})()"
 )
-# How a tab is recognised as the editor. "celestjux" and "pixel-room" catch the
-# deployed hosts; "/room/" and "/char/" catch a local one, which is what a
-# `python3 -m http.server` in front of the editors actually serves and what the
-# first two marks quietly missed.
-EDITOR_URL_MARKS = ("celestjux", "pixel-room", "/room/", "/char/")
 
-# The name the editor's own `help` prints in front of every verb, and so the one
-# prefix `call` has to strip off a verb it is handed.
-CJX_NAME = "cjx"
+# The character editor's surface, reached the same two ways. Its own comment
+# calls it a test hook rather than an agent surface: the verbs return raw values
+# and throw on bad input, where cjx answers {error, hint}. `call` tags the
+# outcome either way, so a throw arrives as data rather than as a CDP error.
+CHAR_HANDLE = (
+    "(function(){"
+    "  if (typeof __editor !== 'undefined') return __editor;"
+    "  try {"
+    "    var f = document.getElementById('frame-char');"
+    "    return (f && f.contentWindow && f.contentWindow.__editor) || null;"
+    "  } catch (e) { return null; }"
+    "})()"
+)
+
+# The character frame carries a 1.4 MB atlas, so the shell leaves it with no src
+# until someone clicks its tab. An agent never clicks, and would find that frame
+# empty forever -- so ask the shell to show the tab. False on a page that is not
+# the shell, and the caller moves on to the next tab.
+WAKE_CHAR = (
+    "(function(){"
+    "  if (typeof show !== 'function') return false;"
+    "  if (!document.getElementById('frame-char')) return false;"
+    "  show('char'); return true;"
+    "})()"
+)
+
+# What each editor is, in the one place that has to know. `name` is the handle
+# the editor's own docs print in front of its verbs, and so the one prefix a
+# caller may harmlessly type. `marks` only orders which tabs to try first; which
+# page is really the editor is settled by asking the page.
+SURFACES = {
+    "room": {"name": "cjx", "handle": CJX_HANDLE, "wake": None,
+             "marks": ("celestjux", "pixel-room", "/room/")},
+    "char": {"name": "__editor", "handle": CHAR_HANDLE, "wake": WAKE_CHAR,
+             "marks": ("celestjux", "pixel-room", "/char/")},
+}
+
 # A verb is one plain identifier. Anything else is a caller mistake, and building
 # JavaScript out of it would report a syntax error instead of the real problem.
 VERB_NAME = re.compile(r"^[A-Za-z_$][A-Za-z0-9_$]*$")
@@ -124,7 +153,9 @@ class Browser:
         self.proc: subprocess.Popen | None = None
         self.port: int | None = ATTACH_PORT
         self._msg_id = 0
-        self._ws_url: str | None = None
+        # One remembered tab per surface: the two editors can be one shell page
+        # or two tabs, and finding one says nothing about where the other is.
+        self._ws_url: dict[str, str] = {}
 
     def launch(self, url: str) -> dict[str, Any]:
         if ATTACH_PORT is not None:
@@ -211,18 +242,26 @@ class Browser:
                 if msg.get("id") == want:
                     return msg.get("result", {})
 
-    async def _page_ws(self) -> str:
-        """The tab that actually has cjx on it.
+    async def _page_ws(self, surface: str = "room") -> str:
+        """The tab that actually has this surface's object on it.
 
         Matching the URL was wrong, and wrong in the quiet way: a GitHub page
         named celestjux-editors contains "celestjux" exactly as surely as the
         editor does, and it sorted first, so every call answered "the editor is
         not open yet" while the editor sat two tabs along. Ask each page whether
-        cjx is there instead. The URL marks stay on as an ordering hint only, so
-        the likely tab is asked first and the usual case is still one round trip.
+        the object is there instead. The URL marks stay on as an ordering hint
+        only, so the likely tab is asked first and the usual case is one trip.
+
+        Each surface is remembered separately. The two editors can be one shell
+        page carrying both frames or two tabs opened directly, and neither
+        arrangement should have to be declared anywhere.
         """
-        if self._ws_url:
-            return self._ws_url
+        if surface not in SURFACES:
+            raise RuntimeError("No surface called %r — there is %s."
+                               % (surface, " and ".join(SURFACES)))
+        spec = SURFACES[surface]
+        if self._ws_url.get(surface):
+            return self._ws_url[surface]
         try:
             with urllib.request.urlopen(
                     f"http://127.0.0.1:{self.port}/json", timeout=5) as r:
@@ -240,33 +279,49 @@ class Browser:
         if not pages:
             raise RuntimeError("The browser is open but has no page to talk to.")
         pages.sort(key=lambda t: not any(m in t.get("url", "")
-                                         for m in EDITOR_URL_MARKS))
+                                         for m in spec["marks"]))
+        present = f"!!({spec['handle']})"
         for t in pages:
+            ws = t["webSocketDebuggerUrl"]
             try:
-                r = await self._ask(t["webSocketDebuggerUrl"], f"!!({CJX_HANDLE})")
+                if await self._truthy(ws, present):
+                    self._ws_url[surface] = ws
+                    return ws
+                if spec["wake"] and await self._truthy(ws, spec["wake"]):
+                    # The shell was asked to show the tab. The frame has to
+                    # fetch and run before its object exists, so give it a
+                    # moment rather than declaring the editor absent.
+                    for _ in range(40):  # 4 seconds
+                        await asyncio.sleep(0.1)
+                        if await self._truthy(ws, present):
+                            self._ws_url[surface] = ws
+                            return ws
             except Exception:
                 continue
-            if r.get("result", {}).get("value"):
-                self._ws_url = t["webSocketDebuggerUrl"]
-                return self._ws_url
         raise RuntimeError(
-            "None of the %d open tabs has the editor loaded. Open it, or if it "
-            "is open, it is still on the password screen — type the password, "
-            "then call `ready`." % len(pages))
+            "None of the %d open tabs has the %s editor loaded (looking for %s). "
+            "Open it, or if it is open, it may still be on the password screen — "
+            "type the password, then call `ready`."
+            % (len(pages), surface, spec["name"]))
 
-    async def _send(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+    async def _truthy(self, ws_url: str, expression: str) -> bool:
+        r = await self._ask(ws_url, expression)
+        return bool(r.get("result", {}).get("value"))
+
+    async def _send(self, method: str, params: dict[str, Any],
+                    surface: str = "room") -> dict[str, Any]:
         if not self.port:
             raise RuntimeError("Nothing is open yet — call `open` first.")
         self._msg_id += 1
         want = self._msg_id
         try:
-            ws_url = await self._page_ws()
+            ws_url = await self._page_ws(surface)
             conn = await websockets.connect(ws_url, max_size=64 * 1024 * 1024)
         except Exception:
             # The remembered tab may have been closed or navigated away from.
             # Forget it and let the next call look again, rather than failing
             # for the rest of the session on a tab that is gone.
-            self._ws_url = None
+            self._ws_url.pop(surface, None)
             raise
         async with conn as ws:
             await ws.send(json.dumps({"id": want, "method": method, "params": params}))
@@ -275,22 +330,27 @@ class Browser:
                 if msg.get("id") == want:
                     return msg.get("result", {})
 
-    async def evaluate(self, expression: str) -> Any:
+    async def evaluate(self, expression: str, surface: str = "room") -> Any:
         result = await self._send("Runtime.evaluate", {
-            "expression": expression, "returnByValue": True, "awaitPromise": True})
+            "expression": expression, "returnByValue": True, "awaitPromise": True},
+            surface=surface)
         if "exceptionDetails" in result:
             d = result["exceptionDetails"]
             raise RuntimeError(
                 f"{d.get('text', '')} {(d.get('exception') or {}).get('description', '')}".strip())
         return result.get("result", {}).get("value")
 
-    async def call(self, verb: str, args: list[Any]) -> Any:
+    async def call(self, verb: str, args: list[Any], surface: str = "room") -> Any:
+        if surface not in SURFACES:
+            return {"error": f"no surface called {surface!r}",
+                    "hint": "there is " + " and ".join(SURFACES)}
+        spec = SURFACES[surface]
         # `help` prints every verb with its handle attached -- "cjx.floor" -- so a
         # caller who passes back exactly what they read builds cjx.cjx.floor here,
         # which is undefined. Take the prefix off rather than expecting the caller
         # to know the one name they must not type.
-        if verb.startswith(f"{CJX_NAME}."):
-            verb = verb[len(CJX_NAME) + 1:]
+        if verb.startswith(f"{spec['name']}."):
+            verb = verb[len(spec["name"]) + 1:]
         if not VERB_NAME.match(verb):
             return {"error": f"not a verb name: {verb!r}",
                     "hint": "pass the bare name, e.g. \"floor\" -- `help` lists them"}
@@ -299,14 +359,15 @@ class Browser:
         # exception arrived as a bare CDP error naming no verb, and a verb that
         # legitimately returns undefined -- draw() is one -- was indistinguishable
         # from cjx being missing, so a call that worked reported the password
-        # screen instead.
+        # screen instead. The character editor throws on bad input where cjx
+        # answers {error, hint}, so tagging is what makes the two behave alike.
         out = await self.evaluate(
-            f"(function(){{var c={CJX_HANDLE};"
+            f"(function(){{var c={spec['handle']};"
             f"if (!c) return {{gone: true}};"
             f"if (typeof c[{json.dumps(verb)}] !== 'function')"
             f"  return {{unknown: true, have: Object.keys(c)}};"
             f"try {{ return {{ok: true, value: c.{verb}({inner})}}; }}"
-            f"catch (e) {{ return {{threw: String(e)}}; }}}})()")
+            f"catch (e) {{ return {{threw: String(e)}}; }}}})()", surface=surface)
         if out is None or out.get("gone"):
             return {"error": "the editor is not open yet",
                     "hint": "the page is still on the password screen — ask the human "
@@ -319,8 +380,24 @@ class Browser:
                     "hint": "check the argument count and types against `help`"}
         return out.get("value")
 
-    async def has_cjx(self) -> bool:
-        return bool(await self.evaluate(f"!!({CJX_HANDLE})"))
+    async def has_surface(self, surface: str = "room") -> bool:
+        spec = SURFACES[surface]
+        return bool(await self.evaluate(f"!!({spec['handle']})", surface=surface))
+
+    async def verbs(self, surface: str = "room") -> Any:
+        """What this surface actually has on it, asked rather than written down.
+
+        The room editor has `help`; the character editor has no such thing, and
+        its verb list is whatever the page happens to expose today.
+        """
+        spec = SURFACES[surface]
+        out = await self.evaluate(
+            f"(function(){{var c={spec['handle']};"
+            f"return c ? Object.keys(c) : null;}})()", surface=surface)
+        if out is None:
+            return {"error": f"the {surface} editor is not open yet",
+                    "hint": "open it, or type the password if it is waiting on one"}
+        return {"surface": surface, "handle": spec["name"], "verbs": out}
 
     async def screenshot(self) -> bytes:
         r = await self._send("Page.captureScreenshot", {"format": "png"})
@@ -335,7 +412,7 @@ class Browser:
                 self.proc.kill()
         self.proc = None
         self.port = ATTACH_PORT
-        self._ws_url = None
+        self._ws_url = {}
 
 
 browser = Browser()
@@ -380,7 +457,7 @@ async def ready() -> str:
     try:
         if not browser.port:
             return j({"open": False, "hint": "call `open_editor` first"})
-        if not await browser.has_cjx():
+        if not await browser.has_surface():
             return j({"open": True, "waiting": True,
                       "hint": "the human has not typed the password yet"})
         return j({"open": True, "waiting": False,
@@ -480,7 +557,7 @@ async def login(password: str) -> str:
     try:
         if not browser.port:
             return j({"error": "nothing is open", "hint": "call `open_editor` first"})
-        if await browser.has_cjx():
+        if await browser.has_surface():
             return j({"open": True, "waiting": False, "note": "already through"})
 
         filled = await browser.evaluate(
@@ -495,7 +572,7 @@ async def login(password: str) -> str:
         # The submit is a round trip; give it a moment before judging it.
         for _ in range(20):
             await asyncio.sleep(0.5)
-            if await browser.has_cjx():
+            if await browser.has_surface():
                 return j({"open": True, "waiting": False,
                           "room": await browser.call("describe", [])})
             if await browser.evaluate(
@@ -530,6 +607,30 @@ async def call(verb: str, args: list[Any] | None = None) -> str:
     is deployed separately, so `help` may list verbs that have no tool here — this
     is how you reach them without reinstalling anything."""
     return j(await browser.call(verb, args or []))
+
+
+@server.tool()
+async def char(verb: str = "", args: list[Any] | None = None) -> str:
+    """The character editor, the same way `call` is the room editor. Call with no
+    verb to list what it has.
+
+    Its verbs are a test hook rather than a designed agent surface, so they take
+    raw values and throw where cjx would answer {error, hint} — the throw comes
+    back here as data either way. The useful ones:
+
+      ready()            is the sprite pack loaded yet
+      cast()             every character in the cast; select(i) picks one
+      set(key, value)    change one part of the current look
+      json()             the selected character as a character file
+      load(character)    put one back
+      compose()          re-render the sheet after changes
+      state() history()  which way it faces and whether undo has anything
+
+    The character tab is loaded lazily by the shell page, so the first call here
+    asks the shell to show it and waits for it — no clicking needed."""
+    if not verb:
+        return j(await browser.verbs("char"))
+    return j(await browser.call(verb, args or [], surface="char"))
 
 
 if __name__ == "__main__":

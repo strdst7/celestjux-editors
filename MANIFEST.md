@@ -3,7 +3,7 @@
 The two editors from `room-editor/` and `char-editor/`, behind one password, on one link,
 for abang's Discord members to draft their own N-agent room and their own cast.
 
-**Live:** https://celestjux-editors.vercel.app/ · **Password:** `ayambasuhkaki`
+**Live:** https://celestjux-editors.vercel.app/ · **Password:** ask abang — spoken, never written here
 **Vercel project:** `celestjux-editors` (team `juxtapo9090`, `prj_U8PvP97XlHC7sCg86EZQDHBRDmVs`)
 
 Nothing in `room-editor/`, `char-editor/` or `kraked-arena/` was modified. This tree is a
